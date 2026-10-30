@@ -24,12 +24,44 @@ SIMULATOR_NAME_PREFIX = "HFSIM"
 DEBUG_ADVERTISEMENT_CHAR = "686f6572-6672-6175-0002-000000000000"
 
 
-def is_simulator(service_info: BluetoothServiceInfoBleak) -> bool:
+def is_simulator(service_info: BluetoothServiceInfoBleak | BLEDevice) -> bool:
     return (service_info.name or "").startswith(SIMULATOR_NAME_PREFIX)
+
+
+async def async_prefer_le(ble_device: BLEDevice) -> None:
+    """The Mac advertises from its public address with flags that say it also
+    speaks Bluetooth Classic, so BlueZ picks a BR/EDR connection to it and fails
+    (br-connection-unknown). Pin the device's bearer to LE before connecting.
+    A real drive advertises as LE only and never gets here."""
+    details = ble_device.details
+    path = details.get("path") if isinstance(details, dict) else None
+    if path is None:  # not a local BlueZ adapter, e.g. a proxy
+        return
+    from dbus_fast import BusType, Message, MessageType, Variant
+    from dbus_fast.aio import MessageBus
+
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    try:
+        reply = await bus.call(
+            Message(
+                destination="org.bluez",
+                path=path,
+                interface="org.freedesktop.DBus.Properties",
+                member="Set",
+                signature="ssv",
+                body=["org.bluez.Device1", "PreferredBearer", Variant("s", "le")],
+            )
+        )
+    finally:
+        bus.disconnect()
+    if reply is not None and reply.message_type is MessageType.ERROR:
+        # Older BlueZ without PreferredBearer: connect anyway.
+        _LOGGER.debug("Could not prefer LE for %s: %s %s", ble_device.address, reply.error_name, reply.body)
 
 
 async def async_read_advertisement(ble_device: BLEDevice, rssi: int) -> AdvertisementInfo:
     """The advertisement the simulated drive would send, read over GATT."""
+    await async_prefer_le(ble_device)
     client = await establish_connection(BleakClientWithServiceCache, ble_device, SIMULATOR_NAME_PREFIX, max_attempts=2)
     try:
         raw = await client.read_gatt_char(DEBUG_ADVERTISEMENT_CHAR)

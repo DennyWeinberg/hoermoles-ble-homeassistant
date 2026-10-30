@@ -10,10 +10,12 @@ from __future__ import annotations
 import base64
 import json
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
+from dbus_fast import BusType, Message, MessageType
 from hoerfrau.drive import DriveState, SimulatedDrive
 from hoerfrau.loopback import LoopbackTransport
 from homeassistant.config_entries import SOURCE_BLUETOOTH, SOURCE_USER
@@ -35,7 +37,8 @@ from custom_components.hoermoles_ble.const import (
     CONF_SERIAL_NO,
     DOMAIN,
 )
-from custom_components.hoermoles_ble.simulator import DEBUG_ADVERTISEMENT_CHAR, is_simulator
+from custom_components.hoermoles_ble.controller import open_transport
+from custom_components.hoermoles_ble.simulator import DEBUG_ADVERTISEMENT_CHAR, async_prefer_le, is_simulator
 
 from .conftest import ADDRESS, ROOT_KEY, SERIAL, inject, long_packet, service_info
 
@@ -271,6 +274,64 @@ async def test_user_step_lists_simulator(hass: HomeAssistant) -> None:
     ):
         result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
     assert list(result["data_schema"].schema[CONF_ADDRESS].container) == [ADDRESS]
+
+
+class FakeBus:
+    """dbus_fast's MessageBus, answering every call with `reply_type`."""
+
+    reply_type = MessageType.METHOD_RETURN
+    calls: list[Message]
+
+    def __init__(self, bus_type) -> None:
+        assert bus_type is BusType.SYSTEM
+        FakeBus.calls = []
+
+    async def connect(self) -> FakeBus:
+        return self
+
+    async def call(self, message: Message) -> Message:
+        FakeBus.calls.append(message)
+        message.serial = len(FakeBus.calls)  # the real bus numbers its messages
+        if self.reply_type is MessageType.ERROR:
+            return Message.new_error(message, "org.freedesktop.DBus.Error.InvalidArgs", "No such property")
+        return Message.new_method_return(message)
+
+    def disconnect(self) -> None:
+        pass
+
+
+SIM_PATH = "/org/bluez/hci0/dev_9C_58_84_82_58_20"
+
+
+async def test_prefer_le_pins_the_bearer() -> None:
+    with patch("dbus_fast.aio.MessageBus", FakeBus):
+        await async_prefer_le(BLEDevice("9C:58:84:82:58:20", SIM_NAME, {"path": SIM_PATH, "props": {}}))
+    (message,) = FakeBus.calls
+    assert (message.destination, message.path, message.member) == ("org.bluez", SIM_PATH, "Set")
+    assert message.body[:2] == ["org.bluez.Device1", "PreferredBearer"]
+    assert message.body[2].value == "le"
+
+
+async def test_prefer_le_tolerates_old_bluez() -> None:
+    with patch("dbus_fast.aio.MessageBus", FakeBus), patch.object(FakeBus, "reply_type", MessageType.ERROR):
+        await async_prefer_le(BLEDevice("9C:58:84:82:58:20", SIM_NAME, {"path": SIM_PATH, "props": {}}))
+    assert len(FakeBus.calls) == 1
+
+
+async def test_prefer_le_skips_non_bluez_devices() -> None:
+    with patch("dbus_fast.aio.MessageBus", side_effect=AssertionError("no D-Bus for a proxy")):
+        await async_prefer_le(BLEDevice("9C:58:84:82:58:20", SIM_NAME, {"source": "esphome-proxy"}))
+
+
+@pytest.mark.parametrize(("name", "pinned"), [(SIM_NAME, True), ("Hoermann", False)])
+async def test_open_transport_pins_le_for_the_simulator_only(name: str, pinned: bool) -> None:
+    device = BLEDevice(ADDRESS, name, {"path": SIM_PATH, "props": {}})
+    with (
+        patch("custom_components.hoermoles_ble.controller.async_prefer_le") as prefer_le,
+        patch("custom_components.hoermoles_ble.controller.establish_connection", return_value=MagicMock()),
+    ):
+        await open_transport(device, "Garage")
+    assert prefer_le.await_count == (1 if pinned else 0)
 
 
 @pytest.mark.parametrize(

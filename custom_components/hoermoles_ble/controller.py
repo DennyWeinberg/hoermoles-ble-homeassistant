@@ -22,11 +22,14 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
 from .const import CONTROL_TIMEOUT, DOMAIN, REGISTER_TIMEOUT
+from .simulator import async_prefer_le, is_simulator
 
 _LOGGER = logging.getLogger(__name__)
 
 
 async def open_transport(ble_device: BLEDevice, name: str) -> BleTransport:
+    if is_simulator(ble_device):
+        await async_prefer_le(ble_device)
     client = await establish_connection(BleakClientWithServiceCache, ble_device, name, max_attempts=3)
     return BleakTransport.from_client(client, on_log=_LOGGER.debug)
 
