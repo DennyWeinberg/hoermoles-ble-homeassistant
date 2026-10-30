@@ -121,8 +121,9 @@ can't advertise manufacturer data, so the simulator is recognized by its local
 name instead: a debug matcher in `manifest.json` and
 [simulator.py](custom_components/hoermoles_ble/simulator.py) handle names
 starting with `HFSIM` only. They read the would-be advertisement from a debug
-characteristic during registration. Sensors stay *unknown* for the simulator;
-the cover still works.
+characteristic: during registration, and for the sensors every 30 s (5 s while
+the door moves, and about 1 s after a command), over a short BLE connection that
+shares the command lock. Real drives never take this path.
 
 Live test with Home Assistant:
 

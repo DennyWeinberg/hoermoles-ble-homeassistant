@@ -10,13 +10,14 @@ from __future__ import annotations
 import base64
 import json
 import time
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
 from bleak.backends.device import BLEDevice
 from bleak.exc import BleakError
 from dbus_fast import BusType, Message, MessageType
-from hoerfrau.drive import DriveState, SimulatedDrive
+from hoerfrau.drive import Admin, DriveState, SimulatedDrive
 from hoerfrau.loopback import LoopbackTransport
 from homeassistant.config_entries import SOURCE_BLUETOOTH, SOURCE_USER
 from homeassistant.const import CONF_ADDRESS
@@ -24,7 +25,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from homeassistant.util import dt as dt_util
+from pytest_homeassistant_custom_component.common import MockConfigEntry, async_fire_time_changed
 
 from custom_components.hoermoles_ble.config_flow import CONF_QR_LABEL
 from custom_components.hoermoles_ble.const import (
@@ -38,7 +40,13 @@ from custom_components.hoermoles_ble.const import (
     DOMAIN,
 )
 from custom_components.hoermoles_ble.controller import open_transport
-from custom_components.hoermoles_ble.simulator import DEBUG_ADVERTISEMENT_CHAR, async_prefer_le, is_simulator
+from custom_components.hoermoles_ble.simulator import (
+    DEBUG_ADVERTISEMENT_CHAR,
+    POLL_INTERVAL_IDLE,
+    POLL_INTERVAL_MOVING,
+    async_prefer_le,
+    is_simulator,
+)
 
 from .conftest import ADDRESS, ROOT_KEY, SERIAL, inject, long_packet, service_info
 
@@ -274,6 +282,55 @@ async def test_user_step_lists_simulator(hass: HomeAssistant) -> None:
     ):
         result = await hass.config_entries.flow.async_init(DOMAIN, context={"source": SOURCE_USER})
     assert list(result["data_schema"].schema[CONF_ADDRESS].container) == [ADDRESS]
+
+
+async def _tick(hass: HomeAssistant, seconds: float) -> None:
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=seconds))
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+
+async def test_simulator_sensors_are_polled(
+    hass: HomeAssistant, drive: SimulatedDrive, entry_with_key: MockConfigEntry, loopback, debug_characteristic
+) -> None:
+    drive.state.admins[7] = Admin(7, ROOT_KEY, "ha")  # the key in entry_with_key
+    assert await hass.config_entries.async_setup(entry_with_key.entry_id)
+    inject(hass, None, name=SIM_NAME)  # first simulator advertisement starts the polling
+    await _tick(hass, 1)
+    assert debug_characteristic.call_count == 1
+    assert hass.states.get("sensor.garage_position").state == "0.0"
+    assert hass.states.get("binary_sensor.garage_moving").state == "off"
+
+    # The door starts moving on the drive: seen at the next idle read (30 s) ...
+    drive.impulse()
+    drive.tick(3)
+    await _tick(hass, POLL_INTERVAL_IDLE + 1)
+    assert debug_characteristic.call_count == 2
+    assert hass.states.get("sensor.garage_position").state == "20.0"
+    assert hass.states.get("binary_sensor.garage_moving").state == "on"
+    # ... and polled faster while it moves.
+    await _tick(hass, POLL_INTERVAL_IDLE + 1 + POLL_INTERVAL_MOVING + 1)
+    assert debug_characteristic.call_count == 3
+
+    # A command asks for an early read.
+    await hass.services.async_call("button", "press", {"entity_id": "button.garage_impulse"}, blocking=True)
+    assert not drive.moving  # the impulse stopped it
+    await _tick(hass, POLL_INTERVAL_IDLE + POLL_INTERVAL_MOVING + 4)
+    assert debug_characteristic.call_count == 4
+    assert hass.states.get("binary_sensor.garage_moving").state == "off"
+    assert await hass.config_entries.async_unload(entry_with_key.entry_id)
+
+
+async def test_real_drive_is_never_polled(
+    hass: HomeAssistant, drive: SimulatedDrive, entry_with_key: MockConfigEntry
+) -> None:
+    assert await hass.config_entries.async_setup(entry_with_key.entry_id)
+    with patch("custom_components.hoermoles_ble.simulator.establish_connection") as connect:
+        for packet in drive.manufacturer_packets():
+            inject(hass, packet)
+        await _tick(hass, POLL_INTERVAL_IDLE * 3)
+    connect.assert_not_called()
+    assert hass.states.get("sensor.garage_position").state == "0.0"
+    assert await hass.config_entries.async_unload(entry_with_key.entry_id)
 
 
 class FakeBus:

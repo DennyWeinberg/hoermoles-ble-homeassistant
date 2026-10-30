@@ -23,6 +23,13 @@ SIMULATOR_NAME_PREFIX = "HFSIM"
 # Read + notify, JSON: {"company_id": 1972, "packets": ["<short hex>", "<long hex>"], "serial_no": ...}
 DEBUG_ADVERTISEMENT_CHAR = "686f6572-6672-6175-0002-000000000000"
 
+# Seconds between reads of the debug characteristic, standing in for the
+# advertisements the sensors would get from a real drive.
+POLL_INTERVAL_MOVING = 5.0
+POLL_INTERVAL_IDLE = 30.0
+# After a command, read soon so the door shows as moving.
+POLL_AFTER_COMMAND = 1.0
+
 
 def is_simulator(service_info: BluetoothServiceInfoBleak | BLEDevice) -> bool:
     return (service_info.name or "").startswith(SIMULATOR_NAME_PREFIX)
@@ -59,8 +66,8 @@ async def async_prefer_le(ble_device: BLEDevice) -> None:
         _LOGGER.debug("Could not prefer LE for %s: %s %s", ble_device.address, reply.error_name, reply.body)
 
 
-async def async_read_advertisement(ble_device: BLEDevice, rssi: int) -> AdvertisementInfo:
-    """The advertisement the simulated drive would send, read over GATT."""
+async def async_read_packets(ble_device: BLEDevice) -> list[bytes]:
+    """The two manufacturer-data payloads the simulated drive would send, read over GATT."""
     await async_prefer_le(ble_device)
     client = await establish_connection(BleakClientWithServiceCache, ble_device, SIMULATOR_NAME_PREFIX, max_attempts=2)
     try:
@@ -69,4 +76,9 @@ async def async_read_advertisement(ble_device: BLEDevice, rssi: int) -> Advertis
         await client.disconnect()
     packets = [bytes.fromhex(packet) for packet in json.loads(raw)["packets"]]
     _LOGGER.debug("Simulator %s advertises %s", ble_device.address, [p.hex() for p in packets])
-    return AdvertisementInfo.from_scan(ble_device.address, rssi, packets)
+    return packets
+
+
+async def async_read_advertisement(ble_device: BLEDevice, rssi: int) -> AdvertisementInfo:
+    """The advertisement the simulated drive would send, parsed."""
+    return AdvertisementInfo.from_scan(ble_device.address, rssi, await async_read_packets(ble_device))
